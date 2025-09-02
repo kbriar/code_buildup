@@ -1,0 +1,102 @@
+    def _build_diagnosis_prompt(self, basic_metrics: Dict, additional_metrics: Dict,
+                                entity_value: str, trend_data: List[Dict]) -> str:
+        """Build prompt for precise, data-driven diagnosis with narrative structure.
+        NOTE: No 'percentage point contributions' in Root Cause Analysis.
+        Adds regional-level context side-by-side and stays strictly quantitative.
+        """
+        # --- Current standing vs regional ---
+        eff_pct = basic_metrics.get("efficiency", None)  # already in %
+        region_eff = (additional_metrics.get("regional_context") or {}).get("efficiency_pct")
+        region_name = (additional_metrics.get("regional_context") or {}).get("region")
+
+        print(f"Efficiency: {eff_pct} vs regional {region_eff}")
+        print(f"additional metrics: {additional_metrics}")
+
+        # --- Route composition ---
+        c1 = additional_metrics.get("c1_share_pct", 0.0)
+        c2 = additional_metrics.get("c2_share_pct", 0.0)
+        c3 = additional_metrics.get("c3_share_pct", 0.0)
+
+        rc = (additional_metrics.get("regional_context") or {})
+        rc1 = rc.get("route_c1_share_pct", 0.0)
+        rc2 = rc.get("route_c2_share_pct", 0.0)
+        rc3 = rc.get("route_c3_share_pct", 0.0)
+
+        # --- Scale / medians ---
+        tkm = additional_metrics.get("TKM")
+        total_km = additional_metrics.get("Total_KM")
+        peer_med_tkm = additional_metrics.get("peer_median_TKM")
+        peer_med_tot = additional_metrics.get("peer_median_Total_KM")
+
+        tkm_vs_peer = self._calculate_percentage_diff(tkm or 0.0, peer_med_tkm or 0.0) if peer_med_tkm else "n/a"
+        tot_vs_peer = self._calculate_percentage_diff(total_km or 0.0, peer_med_tot or 0.0) if peer_med_tot else "n/a"
+
+        # --- SOH and driver efficiency variability ---
+        soh = additional_metrics.get("SOH", 0.0)
+        drv_std = additional_metrics.get("driver_variability_std_pp")
+        drv_top = additional_metrics.get("top_driver_efficiency_pp")
+        drv_bot = additional_metrics.get("bottom_driver_efficiency_pp")
+        drv_txt = ""
+        # print(f"Driver efficiency variability: {drv_std}, {drv_top}, {drv_bot}")
+
+        if drv_std is not None and drv_top is not None and drv_bot is not None:
+            drv_txt = (
+                f"Driver efficiency variability std ≈ {drv_std:.2f} pp; "
+                f"Top ≈ {drv_top:.2f}%; Bottom ≈ {drv_bot:.2f}%."
+            )
+
+        # Trending (optional)
+        # --- Trending (optional)
+        trend_txt = ""
+        if trend_data and len(trend_data) >= 2:
+            seq_parts = []
+            for r in trend_data[-4:]:
+                # accept either {'period': 'YYYY-MM', 'value': <num>} or {'month': 'Mon YYYY', 'efficiency': <num>}
+                label = r.get("period") or r.get("month")
+                if isinstance(label, (pd.Timestamp, datetime)):
+                    label = label.strftime("%b %Y")
+                val = r.get("value", None)
+                if val is None:
+                    val = r.get("efficiency")
+                    # if efficiency is a fraction, scale to %
+                    if val is not None and val <= 1.0:
+                        val *= 100.0
+                if label and val is not None:
+                    seq_parts.append(f"{label}: {val:.2f}%")
+            if seq_parts:
+                trend_txt = "Recent trend: " + " \u2192 ".join(seq_parts) + "."
+
+        # Build a concise, factual prompt WITHOUT pp contributions
+        prompt = f"""
+    You are an analytics writer. Produce a concise, structured root cause write-up.
+    1. Use ONLY the exact numbers provided above - no estimations or assumptions
+    2. ABSOLUTELY NO vague language: no "may", "could", "suggest", "potential", "might"
+    3. Structure the analysis in this exact format:
+
+    Entity: {entity_value}
+    Region: {region_name if region_name else "n/a"}
+
+    Current Standing:
+    - Efficiency: {eff_pct:.2f}%{f" vs regional {region_eff:.2f}%" if region_eff else ""}
+
+    Root Cause Analysis (no percentage-point attributions):
+    1) Operational Effectiveness
+      - {drv_txt if drv_txt else "Driver efficiency variability could not be computed (missing driver ids or efficiency)."}
+      - SOH utilization: {soh:,.0f} hours{f"; regional SOH total: {rc.get('SOH'):,.0f} hours" if rc.get('SOH') is not None else ""}.
+
+    2) Route Composition
+      - Entity mix: C1 {c1:.1f}%, C2 {c2:.1f}%, C3 {c3:.1f}%.
+      - Regional mix: C1 {rc1:.1f}%, C2 {rc2:.1f}%, C3 {rc3:.1f}%.
+
+    3) Scale Context (vs regional peers excluding the entity)
+      - TKM: {tkm:,.0f}{f" ({tkm_vs_peer})" if peer_med_tkm else ""}; Total_KM: {total_km:,.0f}{f" ({tot_vs_peer})" if peer_med_tot else ""}.
+
+    {"Trend" + ": " + trend_txt if trend_txt else ""}
+
+    Conclusion: [Generate a conclusion here]
+    Guidance:
+    - Be specific and quantitative. Do not invent “+X percentage points contributed”.
+    - Prefer statements like “higher/lower than region by X%” or “over-indexing C1 by Y pp vs region”.
+    - Keep the narrative within 6–8 short bullet lines.
+    """
+        return prompt
