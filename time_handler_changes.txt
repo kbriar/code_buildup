@@ -1,0 +1,170 @@
+    def extract_timeframe(self, user_query: str, intents: list, df=None, date_col: str = "drive_date"):
+        print(".....In extract_timeframe....")
+        parsed = {}
+        parsed = self.time_handler.parse_time_expression(user_query, reference_date=self.time_handler.now)
+        print(f"Parsed timeframe: {parsed}")
+
+        # Optional: clip to data range if df is available here
+        if df is not None and date_col in df.columns:
+            data_min = df[date_col].min()
+            data_max = df[date_col].max()
+            from datetime import date
+            p_start = datetime.fromisoformat(parsed["start"]).date()
+            p_end   = datetime.fromisoformat(parsed["end"]).date()
+            c_start = max(p_start, data_min.date())
+            c_end   = min(p_end,   data_max.date())
+            parsed["start"] = c_start.isoformat()
+            parsed["end"]   = c_end.isoformat()
+
+        # one timeframe object per intent (so downstream can keep provenance)
+        tfs = []
+        for intent in intents or []:
+            tf = {
+                "period_in_query": parsed.get("period_in_query", "all data"),
+                "start": parsed["start"],
+                "end": parsed["end"],
+                "intent_ref": intent
+            }
+            tfs.append(tf)
+        return tfs
+
+-----------------------------------------------------------------------------------------------------------------------------------
+
+import calendar
+
+
+
+class TimeExpressionHandler:
+    def __init__(self):
+        # Treat this as "today" / dataset end
+        self.now = datetime(2025, 8, 4, 15, 11)
+
+        self._month_map = {
+            "jan":1, "january":1, "feb":2, "february":2, "mar":3, "march":3,
+            "apr":4, "april":4, "may":5, "jun":6, "june":6, "jul":7, "july":7,
+            "aug":8, "august":8, "sep":9, "sept":9, "september":9,
+            "oct":10, "october":10, "nov":11, "november":11, "dec":12, "december":12
+        }
+
+        # Non-capturing month token
+        self._MONTH_PAT = (
+            r'(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|'
+            r'jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|'
+            r'oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)'
+        )
+
+        # Compile month-range once; case-insensitive
+        self.PAT_MONTH_RANGE = re.compile(
+            rf'\b(?:between\s+)?(?P<m1>{self._MONTH_PAT})(?:\s+(?P<y1>\d{{4}}))?\s+(?:and|to|through|-)\s+(?P<m2>{self._MONTH_PAT})(?:\s+(?P<y2>\d{{4}}))?(?:\s+months?)?\b',
+            re.IGNORECASE
+        )
+
+    def _last_day(self, y: int, m: int) -> int:
+        return calendar.monthrange(y, m)[1]
+
+    def _parse_month_range_or_none(self, expr: str, reference_date: datetime):
+        m = self.PAT_MONTH_RANGE.search(expr)  # search (not match)
+        if not m:
+            return None
+
+        gd = m.groupdict()
+        m1_name = gd['m1'].lower()
+        m2_name = gd['m2'].lower()
+        y1 = int(gd['y1']) if gd['y1'] else None
+        y2 = int(gd['y2']) if gd['y2'] else None
+
+        m1 = self._month_map[m1_name]
+        m2 = self._month_map[m2_name]
+        ref_y = reference_date.year
+
+        # Year inference rules
+        if y1 is None and y2 is None:
+            if m1 <= m2:
+                y1 = y2 = ref_y
+            else:
+                y1 = ref_y - 1; y2 = ref_y
+        elif y1 is None:
+            y1 = y2 if m1 <= m2 else y2 - 1
+        elif y2 is None:
+            y2 = y1 if m1 <= m2 else y1 + 1
+
+        start = datetime(y1, m1, 1)
+        end   = datetime(y2, m2, self._last_day(y2, m2))
+        label = f"{start:%b %Y}–{end:%b %Y}"
+        return {"start": start.strftime("%Y-%m-%d"),
+                "end":   end.strftime("%Y-%m-%d"),
+                "period_in_query": label}
+
+    def parse_time_expression(
+        self,
+        expression: str,
+        reference_date: Optional[datetime] = None
+    ) -> Dict[str, str]:
+
+        if not reference_date:
+            reference_date = self.now
+        lower_expr = expression.lower().strip()
+
+        # 0) Named special cases
+        special_cases = {
+            "this week": lambda ref: {"start": (ref - timedelta(days=ref.weekday())).strftime("%Y-%m-%d"),
+                                      "end":   (ref + timedelta(days=(6 - ref.weekday()))).strftime("%Y-%m-%d")},
+            "last week": lambda ref: {"start": (ref - timedelta(days=ref.weekday() + 7)).strftime("%Y-%m-%d"),
+                                      "end":   (ref - timedelta(days=ref.weekday() + 1)).strftime("%Y-%m-%d")},
+            "this month": lambda ref: {"start": ref.replace(day=1).strftime("%Y-%m-%d"),
+                                      "end":   (ref.replace(day=1) + relativedelta(months=1) - timedelta(days=1)).strftime("%Y-%m-%d")},
+            "last month": lambda ref: {"start": (ref.replace(day=1) - relativedelta(months=1)).strftime("%Y-%m-%d"),
+                                      "end":   (ref.replace(day=1) - timedelta(days=1)).strftime("%Y-%m-%d")},
+            "this year": lambda ref: {"start": ref.replace(month=1, day=1).strftime("%Y-%m-%d"),
+                                      "end":   ref.replace(month=12, day=31).strftime("%Y-%m-%d")},
+            "last year": lambda ref: {"start": ref.replace(year=ref.year - 1, month=1, day=1).strftime("%Y-%m-%d"),
+                                      "end":   ref.replace(year=ref.year - 1, month=12, day=31).strftime("%Y-%m-%d")},
+            "this quarter": lambda ref: {"start": ref.replace(month=((ref.month - 1)//3*3 + 1), day=1).strftime("%Y-%m-%d"),
+                                        "end":   (ref.replace(month=((ref.month - 1)//3*3 + 1), day=1)
+                                                  + relativedelta(months=3) - timedelta(days=1)).strftime("%Y-%m-%d")},
+            "last quarter": lambda ref: {"start": (ref.replace(month=((ref.month - 1)//3*3 + 1), day=1)
+                                                  - relativedelta(months=3)).strftime("%Y-%m-%d"),
+                                        "end":   (ref.replace(month=((ref.month - 1)//3*3 + 1), day=1)
+                                                  - timedelta(days=1)).strftime("%Y-%m-%d")},
+            "till now": lambda ref: {"start": "1970-01-01", "end": ref.strftime("%Y-%m-%d")},
+            "as of yesterday": lambda ref: {"start": "1970-01-01", "end": (ref - timedelta(days=1)).strftime("%Y-%m-%d")}
+        }
+        for expr, fn in special_cases.items():
+            if expr in lower_expr:
+                out = fn(reference_date)
+                out["period_in_query"] = expr
+                return out
+
+        # 1) “past/last N months/years”
+        range_match = re.search(r'\b(?:last|past)\s+(\d+)\s+(month|months|year|years)\b', lower_expr)
+        if range_match:
+            num, unit = int(range_match.group(1)), range_match.group(2)
+            if unit.startswith("month"):
+                start = reference_date.replace(day=1) - relativedelta(months=num)
+                end = reference_date
+                label = f"past {num} months"
+            else:
+                start = reference_date.replace(year=reference_date.year - num, month=1, day=1)
+                end = reference_date.replace(month=12, day=31)
+                label = f"past {num} years"
+            return {"start": start.strftime("%Y-%m-%d"), "end": end.strftime("%Y-%m-%d"), "period_in_query": label}
+
+        # 2) Month-to-month range (with optional years, and optional “months” suffix)
+        res = self._parse_month_range_or_none(lower_expr, reference_date)
+        if res:
+            return res
+
+        # 3) Single month (with optional year)
+        m = re.search(rf'\b(?:in\s+)?(?P<mon>{self._MONTH_PAT})(?:\s+(?P<year>\d{{4}}))?\b', lower_expr)
+        if m:
+            m_name = m.group('mon')
+            y = int(m.group('year')) if m.group('year') else reference_date.year
+            mo = self._month_map[m_name]
+            start = datetime(y, mo, 1)
+            end   = datetime(y, mo, self._last_day(y, mo))
+            return {"start": start.strftime("%Y-%m-%d"), "end": end.strftime("%Y-%m-%d"),
+                    "period_in_query": start.strftime('%b %Y')}
+
+        # 4) Fallback
+        logging.warning(f"No match for time expression: {lower_expr}")
+        return {"start": "1970-01-01", "end": reference_date.strftime("%Y-%m-%d"), "period_in_query": "all data"}
